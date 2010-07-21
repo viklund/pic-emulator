@@ -1,66 +1,44 @@
 -module(pic_emulator).
 %-compile(export_all). %% REPLACE
 
--export([pic200_new/0, pic200_print/1, pic200_load_program/2,
-        pic200_run_program/1, pic200_cycle/1]).
-
-%% Record of a pic200.
-% accumulator 8 bits
-% register, 32 bytes. Divided into SFR (Special Function Registers) and GPR
-%                     0-7 SFR and 16 GPR
-%             0 -> INDF, Uses content of FSR to address data memory
-%             1 -> TMR0, 8-bit real-time clock/counter
-%             2 -> PCL, Low-order 8 bits of PC (Program counter)
-%             3 -> STATUS, Status of ALU
-%             4 -> FSR, Indirect data memory access pointer
-%             5 -> OSCCAL
-%             6 -> GPIO    last 4 bits only.
-%             7 -> CMCON0 (pic204 only).
-%         16-31 -> GPR
+-export([new/0, print/1, load_program/2,
+        run_program/1, cycle/1]).
 
 -record(pic200,{ 
-        accumulator = <<0>>,       %        8 bits
-        register,                  %       32 bytes
-        callstack = [<<0>>,<<0>>], %        2 bytes
-        program,                   % 256 x 12 bits
-
-        option,                    %        8 bits
-        trisgpio,                  %        8 bits (but only 4bits used)
+        accumulator = <<0>>,           %        8 bits
+        register = pic_register:new(), %       32 bytes
+        callstack = [<<0>>,<<0>>],     %        2 bytes
+        program,                       % 256 x 12 bits
+                                       
+        option,                        %        8 bits
+        trisgpio,                      %        8 bits (but only 4bits used)
 
         instruction_register = <<0:12>>
     }).
 
 -record(opcode,{
         opcode    = nop,
-        address   = 0,
+        address   = 16#1F, % Last register is safe default
         whence    = accumulator,
         constant  = 0,
         bit       = 0
     }).
 
-register_new()             -> register_new(32,8).
-register_new(Length,Width) -> lists:duplicate(Length,<<0:Width>>).
-
-register_get(N, L) -> lists:nth(N+1,L).
-register_set(N, V, L) ->
-    {H,[_|T]} = lists:split(N,L),
-    H ++ [V] ++ T.
-
-pic200_new() ->
+new() ->
     #pic200{
-        register = register_new(),
-        program  = register_new(10,12)
+        register = pic_register:new(),
+        program  = lists:duplicate(255,<<0:12>>)
     }.
 
-pic200_load_program(P, File) ->
+load_program(P, File) ->
     {ok, Bin} = file:read_file(File),
     Program = read_program(Bin,[]),
     P#pic200{ program = Program ++ lists:duplicate(10,<<0:12>>) }.
 
 read_program(<<>>, Acc) -> lists:reverse(Acc);
 read_program(<<H:12,Rest/bitstring>>, Acc) ->
-    read_program(Rest, [<<H:12>>|Acc]);
-read_program(<<_/bitstring>>, Acc) -> lists:reverse(Acc).
+    read_program(Rest, [<<H:12>>|Acc]).
+%read_program(<<_/bitstring>>, Acc) -> lists:reverse(Acc).
 
 %% Description of one cycle (4 clocks)
 %     Fetch cycle       Execution cycle
@@ -71,7 +49,7 @@ read_program(<<_/bitstring>>, Acc) -> lists:reverse(Acc).
 
 % maybe simulate a clock with an actor to drive this instead
 % But then the pic200 record needs to be expanded
-pic200_cycle(P) ->
+cycle(P) ->
     % Q1 Fetch
     P0    = increment_program_counter(P),
     % Q1 Execute
@@ -80,27 +58,29 @@ pic200_cycle(P) ->
     % Q2 Execute
     #opcode{opcode = Opcode, address = Addr, whence = Whence, constant = K, bit = B} 
         = unpack_opcode(Instr),
-    <<FVal:8>> = register_get( Addr, P0#pic200.register ),
+    <<FVal:8>> = pic_register:get( Addr, P0#pic200.register ),
 
     % Q3 Execute
     Func = orddict:fetch(Opcode,opcode_table()),
     {Store,Res,P1} = Func(P0, P0#pic200.accumulator, FVal, K, B),
 
+    %% Check if program_counter has changed, if so load nop (<<0:12>>) into Instr
+
     % Q4 Fetch
-    <<PC:8>>  = register_get( 2, P1#pic200.register ),
-    NextInstr = register_get( PC, P1#pic200.program ),
+    <<PC:8>>  = pic_register:get( 2, P1#pic200.register ),
+    NextInstr = pic_register:get( PC, P1#pic200.program ),
     P2 = P1#pic200{ instruction_register = NextInstr },
 
     % Q4 Execute
     case store(Store,Whence) of
         accumulator     -> P2#pic200{ accumulator = <<Res:8>> };
-        source_register -> P2#pic200{ register = register_set(Addr, <<Res:8>>, P1#pic200.register) };
+        source_register -> P2#pic200{ register = pic_register:set(Addr, <<Res:8>>, P1#pic200.register) };
         no              -> P2
     end.
 
-pic200_run_program(P = #pic200{ register = R, program = Program } ) ->
-    <<PC:8>>  = register_get( 2, R ),
-    OpcodeBin = register_get( PC, Program ),
+run_program(P = #pic200{ register = R, program = Program } ) ->
+    <<PC:8>>  = pic_register:get( 2, R ),
+    OpcodeBin = pic_register:get( PC, Program ),
     <<T:12>> = OpcodeBin,
     io:format("Will run opcode(~w) ~w~n",[PC,T]),
     execute_opcode(OpcodeBin, P).
@@ -109,44 +89,28 @@ execute_opcode(OpcodeBin, P = #pic200{accumulator = <<Acc:8>>}) ->
     #opcode{opcode = Opcode, address = Addr, whence = Whence, constant = K, bit = B} 
         = unpack_opcode(OpcodeBin),
     valid_addr(Addr),
-    <<FVal:8>> = register_get( Addr, P#pic200.register ),
+    <<FVal:8>> = pic_register:get( Addr, P#pic200.register ),
     Func = orddict:fetch(Opcode,opcode_table()),
     {Store,Res,ResP} = Func(increment_program_counter(P), Acc, FVal, K, B), % Should we really increment here
     case store(Store,Whence) of
         accumulator     -> ResP#pic200{ accumulator = <<Res:8>> };
-        source_register -> ResP#pic200{ register = register_set(Addr, <<Res:8>>, ResP#pic200.register) };
+        source_register -> ResP#pic200{ register = pic_register:set(Addr, <<Res:8>>, ResP#pic200.register) };
         no              -> ResP
     end.
 
-pic200_print(#pic200{
+print(#pic200{
         accumulator = <<A>>, register = R, callstack = [<<C1>>,<<C2>>],
         program     = P
     }) ->
     io:format("Accumulator: ~8.2B ~3.10B   Callstack: ~8.2B ~8.2b~n",[A,A,C1,C2]),
     io:format("Registers:~n"),
-    register_print(R),
+    pic_register:print(R),
     io:format("Program:~n"),
     program_print(P),
     ok.
 
-register_print(R) ->
-    register_print(R,0).
-
 program_print(P) ->
     program_print(lists:sublist(P,1,9),0).
-
-register_print([],_) -> io:nl();
-register_print([_|R],A) when A > 7, A < 16 -> register_print(R,A+1);
-register_print([<<H:8>>|R],A) ->
-    case A of
-        0  -> io:format("  SPR:~n  ");
-        16 -> io:format("GPR:~n  ");
-        _  -> nil
-    end,
-    case A rem 4 of
-        3 -> io:format("  ~2.10B : ~8.2.0B ~3.10B~n  ",[A,H,H]), register_print(R,A+1);
-        _ -> io:format("  ~2.10B : ~8.2.0B ~3.10B",    [A,H,H]), register_print(R,A+1)
-    end.
 
 program_print([],_) -> io:nl();
 program_print([HeadBin|R],A) ->
@@ -163,7 +127,7 @@ valid_addr(_) -> ok. % Should check in future
 store(store,W) -> W;
 store(S,_)     -> S.
 
-%% fun(#pic200, Acc, RVal, K, bits)
+%% fun(#pic200, Acc, RVal, K, bits) -> {store, res, P}
 opcode_table() -> orddict:from_list([
         {nop,   fun(P,_,_,_,_) -> {             no,       0 , P} end },
         {clrw,  fun(P,_,_,_,_) -> {    accumulator,       0 , P} end },
@@ -203,13 +167,13 @@ opcode_table() -> orddict:from_list([
 
 goto(P = #pic200{ register = R }, K) ->
     case bit_size(K) of
-        8 -> P#pic200{ register = register_set(2, K, R) };
+        8 -> P#pic200{ register = pic_register:set(2, K, R) };
         9 -> <<_:1,RealK:8>> = K,
-             P#pic200{ register = register_set(2, RealK, R) }
+             P#pic200{ register = pic_register:set(2, RealK, R) }
     end.
 
 call(P = #pic200{ register = R, callstack = C }, K) ->
-    goto( P#pic200{ callstack = [register_get(2,R),hd(C)] }, K ).
+    goto( P#pic200{ callstack = [pic_register:get(2,R),hd(C)] }, K ).
 
 return(P = #pic200{ callstack = [A|R] } ) ->
     goto( P#pic200{ callstack = R }, A ).
