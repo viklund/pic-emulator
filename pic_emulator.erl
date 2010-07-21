@@ -2,18 +2,20 @@
 %-compile(export_all). %% REPLACE
 
 -export([new/0, print/1, load_program/2,
-        run_program/1, cycle/1]).
+        run_program/1,run_program/2, cycle/3]).
 
 -record(pic200,{ 
         accumulator = <<0>>,           %        8 bits
         register = pic_register:new(), %       32 bytes
         callstack = [<<0>>,<<0>>],     %        2 bytes
         program,                       % 256 x 12 bits
-                                       
+
         option,                        %        8 bits
         trisgpio,                      %        8 bits (but only 4bits used)
 
-        instruction_register = <<0:12>>
+        instruction_register = <<0:12>>,
+        current_opcode,
+        current_value
     }).
 
 -record(opcode,{
@@ -33,7 +35,8 @@ new() ->
 load_program(P, File) ->
     {ok, Bin} = file:read_file(File),
     Program = read_program(Bin,[]),
-    P#pic200{ program = Program ++ lists:duplicate(10,<<0:12>>) }.
+    E = 255 - length(Program),
+    P#pic200{ program = Program ++ lists:duplicate(E,<<0:12>>) }.
 
 read_program(<<>>, Acc) -> lists:reverse(Acc);
 read_program(<<H:12,Rest/bitstring>>, Acc) ->
@@ -47,42 +50,31 @@ read_program(<<H:12,Rest/bitstring>>, Acc) ->
 % Q3.   -               execute_instr
 % Q4. fetch_pc -> ir1   write_result  (to reg)
 
-% maybe simulate a clock with an actor to drive this instead
-% But then the pic200 record needs to be expanded
-cycle(P) ->
-    % Q1 Fetch
-    P0    = increment_program_counter(P),
-    % Q1 Execute
-    Instr = P0#pic200.instruction_register,
+cycle(P,q1,fetch) -> increment_program_counter(P);
+cycle(P,q4,fetch) ->
+    <<PC:8>>  = pic_register:get( 2,  P#pic200.register ),
+    NextInstr = pic_register:get( PC, P#pic200.program ),
+    P#pic200{ instruction_register = NextInstr };
+cycle(P,_,fetch) -> P;
 
-    % Q2 Execute
-    #opcode{opcode = Opcode, address = Addr, whence = Whence, constant = K, bit = B} 
-        = unpack_opcode(Instr),
-    <<FVal:8>> = pic_register:get( Addr, P0#pic200.register ),
+cycle(P,q1,execute) ->
+    O = unpack_opcode(P#pic200{ instruction_register } ),
+    P#pic200{ current_opcode = O };
+cycle(P,q2,execute) ->
+    O = P#pic200.current_opcode,
+    <<FVal:8>> = pic_register:get( O#opcode.address, P#pic200.register ),
+    P#pic200{ current_value = FVal };
+cycle(P,q3,execute) -> P;
+cycle(P,q4,execute) -> P.
 
-    % Q3 Execute
-    Func = orddict:fetch(Opcode,opcode_table()),
-    {Store,Res,P1} = Func(P0, P0#pic200.accumulator, FVal, K, B),
-
-    %% Check if program_counter has changed, if so load nop (<<0:12>>) into Instr
-
-    % Q4 Fetch
-    <<PC:8>>  = pic_register:get( 2, P1#pic200.register ),
-    NextInstr = pic_register:get( PC, P1#pic200.program ),
-    P2 = P1#pic200{ instruction_register = NextInstr },
-
-    % Q4 Execute
-    case store(Store,Whence) of
-        accumulator     -> P2#pic200{ accumulator = <<Res:8>> };
-        source_register -> P2#pic200{ register = pic_register:set(Addr, <<Res:8>>, P1#pic200.register) };
-        no              -> P2
-    end.
+run_program(P , 0 ) -> P;
+run_program(P, Steps ) ->
+    PN = run_program(P),
+    run_program(PN, Steps - 1).
 
 run_program(P = #pic200{ register = R, program = Program } ) ->
     <<PC:8>>  = pic_register:get( 2, R ),
     OpcodeBin = pic_register:get( PC, Program ),
-    <<T:12>> = OpcodeBin,
-    io:format("Will run opcode(~w) ~w~n",[PC,T]),
     execute_opcode(OpcodeBin, P).
 
 execute_opcode(OpcodeBin, P = #pic200{accumulator = <<Acc:8>>}) ->
@@ -91,12 +83,16 @@ execute_opcode(OpcodeBin, P = #pic200{accumulator = <<Acc:8>>}) ->
     valid_addr(Addr),
     <<FVal:8>> = pic_register:get( Addr, P#pic200.register ),
     Func = orddict:fetch(Opcode,opcode_table()),
-    {Store,Res,ResP} = Func(increment_program_counter(P), Acc, FVal, K, B), % Should we really increment here
+    {Store,Res,ResP,Status} = Func(increment_program_counter(P), Acc, FVal, K, B), % Should we really increment here
+
     case store(Store,Whence) of
         accumulator     -> ResP#pic200{ accumulator = <<Res:8>> };
         source_register -> ResP#pic200{ register = pic_register:set(Addr, <<Res:8>>, ResP#pic200.register) };
         no              -> ResP
     end.
+
+chain(Obj, []) -> Obj;
+chain(Obj, [F|Funcs]) -> chain(F(Obj), Funcs).
 
 print(#pic200{
         accumulator = <<A>>, register = R, callstack = [<<C1>>,<<C2>>],
@@ -129,48 +125,59 @@ store(S,_)     -> S.
 
 %% fun(#pic200, Acc, RVal, K, bits) -> {store, res, P}
 opcode_table() -> orddict:from_list([
-        {nop,   fun(P,_,_,_,_) -> {             no,       0 , P} end },
-        {clrw,  fun(P,_,_,_,_) -> {    accumulator,       0 , P} end },
-        {clrf,  fun(P,_,_,_,_) -> {source_register,       0 , P} end },
-        {movwf, fun(P,A,_,_,_) -> {source_register,       A , P} end },
+        {nop,   fun(P,_,_,_,_) -> {             no,       0 , P, []} end },
 
-        {subwf, fun(P,A,F,_,_) -> {store,               F-A , P} end },
-        {decf,  fun(P,_,F,_,_) -> {store,               F-1 , P} end },
-        {iorwf, fun(P,A,F,_,_) -> {store,          A  bor F , P} end },
-        {andwf, fun(P,A,F,_,_) -> {store,          A band F , P} end },
-        {xorwf, fun(P,A,F,_,_) -> {store,          A bxor F , P} end },
-        {addwf, fun(P,A,F,_,_) -> {store,               A+F , P} end },
-        {movf,  fun(P,_,F,_,_) -> {store,                 F , P} end },
-        {comf,  fun(P,_,F,_,_) -> {store,            bnot F , P} end },
-        {incf,  fun(P,_,F,_,_) -> {store,               F+1 , P} end },
-        {decfsz,fun(P,_,1,_,_) -> {accumulator,           0 , P};       % TODO: skip
-                   (P,_,F,_,_) -> {store,               F-1 , P} end },
-        {rrf,   fun(P,_,F,_,_) -> {store,           F bsr 1 , P} end }, % TODO: carry
-        {rlf,   fun(P,_,F,_,_) -> {store,           F bsl 1 , P} end }, % TODO: carry
-        {swapf, fun(P,_,F,_,_) -> {store,          swapf(F) , P} end },
-        {incfsz,fun(P,_,255,_,_) -> {accumulator,         0 , P};       % TODO: skip
-                   (P,_,F,_,_) -> {store,               F+1 , P} end },
+        {clrwdt,fun(P,_,_,_,_) -> {             no,       0 , P, [to,pd]} end },
+        {sleep, fun(P,_,_,_,_) -> {             no,       0 , P, [to,pd]} end },
 
-        {bcf,   fun(P,_,F,_,B) -> {source_register,F bxor (F band (1 bsl (B-1))), P} end},
-        {bsf,   fun(P,_,F,_,B) -> {source_register,F bor (1 bsl (B-1)), P} end },
-        {btfsc, fun(P,_,F,_,B) -> {no, F band (1 bsl (B-1)), P} end }, % TODO: check condition
-        {btfss, fun(P,_,F,_,B) -> {no, F band (1 bsl (B-1)), P} end }, % TODO: check condition
+        {clrw,  fun(P,_,_,_,_) -> {    accumulator,       0 , P, [z]} end },
+        {clrf,  fun(P,_,_,_,_) -> {source_register,       0 , P, [z]} end },
+        {movwf, fun(P,A,_,_,_) -> {source_register,       A , P, []} end },
 
-        {retlw, fun(P,_,_,K,_) -> {accumulator,    K, return(P)} end },
-        {call,  fun(P,_,_,K,_) -> {no         ,    0, call(P,K)} end },
-        {goto,  fun(P,_,_,K,_) -> {no         ,    0, goto(P,K)} end },
-        {movlw, fun(P,_,_,K,_) -> {accumulator,    K,         P} end },
-        {iorlw, fun(P,A,_,K,_) -> {accumulator, K bor A,      P} end },
-        {andlw, fun(P,A,_,K,_) -> {accumulator, K band A,     P} end },
-        {xorlw, fun(P,A,_,K,_) -> {accumulator, K bxor A,     P} end }
+        {subwf, fun(P,A,F,_,_) -> {store,               F-A , P, [z,c,dc]} end },
+        {decf,  fun(P,_,F,_,_) -> {store,               F-1 , P, [z]} end },
+        {iorwf, fun(P,A,F,_,_) -> {store,          A  bor F , P, [z]} end },
+        {andwf, fun(P,A,F,_,_) -> {store,          A band F , P, [z]} end },
+        {xorwf, fun(P,A,F,_,_) -> {store,          A bxor F , P, [z]} end },
+        {addwf, fun(P,A,F,_,_) -> {store,               A+F , P, [z,c,dc]} end },
+        {movf,  fun(P,_,F,_,_) -> {store,                 F , P, [z]} end },
+        {comf,  fun(P,_,F,_,_) -> {store,            bnot F , P, [z]} end },
+        {incf,  fun(P,_,F,_,_) -> {store,               F+1 , P, [z]} end },
+        {decfsz,fun(P,_,1,_,_) -> {accumulator,           0 , skip(P), []};
+                   (P,_,F,_,_) -> {store,               F-1 , P, []} end },
+        {rrf,   fun(P,_,F,_,_) -> {store,           F bsr 1 , P, [c]} end }, % TODO: carry
+        {rlf,   fun(P,_,F,_,_) -> {store,           F bsl 1 , P, [c]} end }, % TODO: carry
+        {swapf, fun(P,_,F,_,_) -> {store,          swapf(F) , P, []} end },
+        {incfsz,fun(P,_,255,_,_) -> {accumulator,         0 , skip(P), []};
+                   (P,_,F,_,_) -> {store,               F+1 , P, []} end },
+
+        {bcf,   fun(P,_,F,_,B) -> {source_register,F bxor (F band (1 bsl (B-1))), P, []} end},
+        {bsf,   fun(P,_,F,_,B) -> {source_register,F bor (1 bsl (B-1)), P, []} end },
+        {btfsc, fun(P,_,F,_,B) -> {no, F band (1 bsl (B-1)), P, []} end }, % TODO: check condition
+        {btfss, fun(P,_,F,_,B) -> {no, F band (1 bsl (B-1)), P, []} end }, % TODO: check condition
+
+        {retlw, fun(P,_,_,K,_) -> {accumulator,    K, return(P), []} end },
+        {call,  fun(P,_,_,K,_) -> {no         ,    0, call(P,K), []} end },
+        {goto,  fun(P,_,_,K,_) -> {no         ,    0, goto(P,K), []} end },
+        {movlw, fun(P,_,_,K,_) -> {accumulator,    K,         P, []} end },
+        {iorlw, fun(P,A,_,K,_) -> {accumulator, K bor A,      P, [z]} end },
+        {andlw, fun(P,A,_,K,_) -> {accumulator, K band A,     P, [z]} end },
+        {xorlw, fun(P,A,_,K,_) -> {accumulator, K bxor A,     P, []} end }
     ]).
 
+clear_insreg(P) -> P#pic200{ instruction_register = <<0:12>> }.
+
+skip(P = #pic200{ register = R}) ->
+    <<O:8>> = pic_register:get(2,R),
+    clear_insreg(P#pic200{ register = pic_register:set(2,O+1,R) }).
+
 goto(P = #pic200{ register = R }, K) ->
-    case bit_size(K) of
+    Pn = case bit_size(K) of
         8 -> P#pic200{ register = pic_register:set(2, K, R) };
         9 -> <<_:1,RealK:8>> = K,
              P#pic200{ register = pic_register:set(2, RealK, R) }
-    end.
+    end,
+    clear_insreg(Pn).
 
 call(P = #pic200{ register = R, callstack = C }, K) ->
     goto( P#pic200{ callstack = [pic_register:get(2,R),hd(C)] }, K ).
@@ -184,10 +191,9 @@ swapf(V) ->
     R.
 
 increment_program_counter(P = #pic200{ register = Reg } ) ->
-    <<PC:8>> = register_get(2, Reg),
+    <<PC:8>> = pic_register:get(2, Reg),
     Inc      = PC + 1,
-    P#pic200{ register = register_set(2, <<Inc:8>>, Reg) }.
-
+    P#pic200{ register = pic_register:set(2, <<Inc:8>>, Reg) }.
 
 whence(0) -> accumulator;
 whence(1) -> source_register.

@@ -1,5 +1,5 @@
 -module(pic_register).
--export([ new/0, new/2, get/2, set/3 ]).
+-export([ new/0, new/2, get/2, set/3, print/1 ]).
 
 % register, 32 bytes. Divided into SFR (Special Function Registers) and GPR
 %                     0-7 SFR and 16 GPR
@@ -60,4 +60,3 @@ print([<<H:8>>|R],A) ->
         3 -> io:format("  ~2.10B : ~8.2.0B ~3.10B~n  ",[A,H,H]), print(R,A+1);
         _ -> io:format("  ~2.10B : ~8.2.0B ~3.10B",    [A,H,H]), print(R,A+1)
     end.
-
