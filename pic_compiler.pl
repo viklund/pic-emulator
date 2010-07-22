@@ -17,13 +17,14 @@ close $P;
 my $opcode_table = opcode_table();
 
 my @opcodes = map { token2opcode($_, $opcode_table) } @program;
-say "OPCODES: ", join(', ', @opcodes);
+say STDERR "OPCODES: ", join(', ', @opcodes);
 my $binary = twelve_bit_pack(@opcodes);
 
 (my $out_file = $text_file) =~ s/\..*?$//;
 $out_file .= '.picc';
 open my $O, '>', $out_file;
-print $O "$binary";
+binmode $O;
+print $O $binary;
 close $O;
 
 exit(0);
@@ -45,6 +46,8 @@ sub extract_token {
     return ($op, @args);
 }
 
+# Takes list of 12-bit values, pairs them up into 24 bit values which are then
+# splitted into 3 8-bit values and then packed as unsigned chars.
 sub twelve_bit_pack {
     my @bits = @_; # List of 12-bit values
     if ( @bits % 2 != 0 ) {
@@ -54,11 +57,10 @@ sub twelve_bit_pack {
     my @bits8;
     while ( my @vals = splice(@bits,0,2) ) {
         my $new_val = ($vals[0] << 12) | $vals[1];
-        push @bits8, ($new_val & (0b1111_1111 << 16)) >> 16;
-        push @bits8, ($new_val & (0b1111_1111 <<  8)) >> 8;
-        push @bits8,  $new_val & (0b1111_1111 <<  0);
+        push @bits8, ($new_val & (0b1111_1111 << 16)) >> 16; # Left-most 8-bits
+        push @bits8, ($new_val & (0b1111_1111 <<  8)) >> 8;  # Middle 8-bits
+        push @bits8,  $new_val & (0b1111_1111 <<  0);        # Right-most 8-bits
     }
-    say "BITS: <<",join(',',map{"$_:8"}@bits8),'>>';
     pack('C*', @bits8);
 }
 

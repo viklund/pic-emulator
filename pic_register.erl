@@ -37,8 +37,8 @@ set_fsr(V,L) ->
     end.
 
 mask_set(N,<<V:8>>,L,Mask) ->
-    <<OldValue:8>> = get(N,L),
-    NV = V band Mask bor OldValue,
+    %<<OldValue:8>> = get(N,L),
+    NV = V band Mask, % bor OldValue,
     simple_set(N, <<NV:8>>, L).
     
 simple_set(N, V, L) ->
